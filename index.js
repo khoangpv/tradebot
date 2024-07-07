@@ -10,9 +10,11 @@ const binance = new ccxt.binance({
 
 binance.setSandboxMode(true);
 
-let currentPosition = null; // Lưu trữ trạng thái hiện tại của vị trí (mua hoặc bán)
-let currentOrders = 0; // Theo dõi số lượng lệnh hiện tại
-let lastOrderTime = null; // Theo dõi thời gian của lệnh cuối cùng
+let currentPosition = null;
+let currentOrders = 0;
+let lastOrderTime = null;
+let openOrders = [];
+let lastCheckedTime = new Date().getTime(); // Thời gian lần kiểm tra cuối cùng
 
 async function getBalance(btcPrice) {
     const balance = await binance.fetchBalance();
@@ -31,12 +33,43 @@ function calculateSMA(prices, period) {
     return sma;
 }
 
+function executeOrder(direction, quantity, price) {
+    const order = {
+        direction,
+        quantity,
+        entryPrice: price,
+        closePrice: null,
+        status: 'open'
+    };
+    openOrders.push(order);
+    currentOrders += 1;
+    lastOrderTime = new Date();
+}
+
+function closeOrder(order, closePrice) {
+    order.status = 'closed';
+    order.closePrice = closePrice;
+    currentOrders -= 1;
+
+    const profitOrLoss = order.direction === 'buy'
+        ? (closePrice - order.entryPrice) * order.quantity
+        : (order.entryPrice - closePrice) * order.quantity;
+
+    console.log(`Order closed: ${order.direction} ${order.quantity} BTC at ${closePrice} USDT, P/L: ${profitOrLoss} USDT`);
+}
+
 async function checkTradingSignal() {
-    const ohlcv = await binance.fetchOHLCV('BTC/USDT', '1m', undefined, 50); // Fetch last 50 minutes of data
+    const now = new Date().getTime();
+    if (now - lastCheckedTime < 5000) { // Chỉ kiểm tra mỗi 5 giây
+        return;
+    }
+    lastCheckedTime = now;
+
+    const ohlcv = await binance.fetchOHLCV('BTC/USDT', '1m', undefined, 50);
     const closes = ohlcv.map(candle => candle[4]);
 
-    const shortSMA = calculateSMA(closes, 10); // 10-period SMA for short-term trend
-    const longSMA = calculateSMA(closes, 30); // 30-period SMA for long-term trend
+    const shortSMA = calculateSMA(closes, 10);
+    const longSMA = calculateSMA(closes, 30);
 
     const lastShortSMA = shortSMA[shortSMA.length - 1];
     const lastLongSMA = longSMA[longSMA.length - 1];
@@ -44,40 +77,42 @@ async function checkTradingSignal() {
     const prevLongSMA = longSMA[longSMA.length - 2];
     const lastPrice = closes[closes.length - 1];
 
-
     let direction = null;
 
-    // Kiểm tra tín hiệu cắt lên (mua)
     if (prevShortSMA <= prevLongSMA && lastShortSMA > lastLongSMA) {
         direction = 'buy';
-    }
-    // Kiểm tra tín hiệu cắt xuống (bán)
-    else if (prevShortSMA >= prevLongSMA && lastShortSMA < lastLongSMA) {
+    } else if (prevShortSMA >= prevLongSMA && lastShortSMA < lastLongSMA) {
         direction = 'sell';
     }
 
-    const now = new Date();
-
-    // Kiểm tra các điều kiện trước khi thực hiện lệnh
     if (direction && direction !== currentPosition && currentOrders < 5 && (!lastOrderTime || (now - lastOrderTime) >= 60000)) {
         const TRADE_SIZE = 100;
         const quantity = TRADE_SIZE / lastPrice;
-        const order = await binance.createMarketOrder('BTC/USDT', direction, quantity);
-        console.log(`${moment().format()}. ${direction} ${quantity} BTC at ${lastPrice} USDT`);
+        executeOrder(direction, quantity, lastPrice);
+        console.log(`${moment().format()}. ${direction} ${quantity} BTC at ${lastPrice} USDT current order ${currentOrders}`);
         await getBalance(lastPrice);
 
-        currentPosition = direction; // Cập nhật trạng thái hiện tại của vị trí
-        currentOrders += 1; // Tăng số lượng lệnh hiện tại
-        lastOrderTime = now; // Cập nhật thời gian của lệnh cuối cùng
+        currentPosition = direction;
+    }
+
+    for (let order of openOrders) {
+        if (order.status === 'open') {
+            const profitOrLoss = order.direction === 'buy'
+                ? (lastPrice - order.entryPrice) * order.quantity
+                : (order.entryPrice - lastPrice) * order.quantity;
+            const profitOrLossPercent = profitOrLoss / (order.entryPrice * order.quantity);
+
+            if (profitOrLossPercent > 0.01 || profitOrLossPercent < -0.01) {
+                closeOrder(order, lastPrice);
+            }
+        }
     }
 }
 
-// Sử dụng WebSocket API của Binance để theo dõi giá theo thời gian thực
 const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@trade');
 
 ws.on('message', async (message) => {
     const data = JSON.parse(message);
-    // Khi có sự thay đổi giá, kiểm tra tín hiệu giao dịch
     await checkTradingSignal();
 });
 
